@@ -98,9 +98,10 @@ function Add-Finding {
     $sevColor = switch ($Severity) { "HIGH" {"Red"} "MEDIUM" {"Yellow"} "INFO" {"Cyan"} default {"White"} }
     
     Write-Host "    [!VULN] [$Category] $Name ($Severity)" -ForegroundColor $sevColor
+    Write-Host "        -> [Risk]: $Details" -ForegroundColor White
     
     if ($ExploitTip) {
-        Write-Host "    [TTP]: $ExploitTip" -ForegroundColor DarkGray
+        Write-Host "        -> [TTP]:  $ExploitTip" -ForegroundColor DarkGray
     }
     
     $global:State.Findings += [pscustomobject]@{
@@ -228,27 +229,104 @@ function Enum-SIDHistory {
 }
 
 function Enum-ACLPrivilege {
-    Write-Section "Deep ACL Analysis (The 'God Mode' Scan)"
-    Write-Line "    [*] Scanning all objects... (Please wait)" "Gray"
+    Write-Section "ACL Analysis"
+    Write-Line "    [*] Scanning Domain Root, Users, Groups, GPOs..." "Gray"
     $found = $false
-    
-    $filter = "(|(objectClass=user)(objectClass=computer)(objectClass=group)(objectClass=groupPolicyContainer)(objectClass=organizationalUnit))"
-    $res = Search-LDAP -Filter $filter -Properties @("ntsecuritydescriptor","samaccountname","displayname","objectclass","distinguishedname")
 
-    $GENERIC_ALL    = 0x10000000; $GENERIC_WRITE  = 0x40000000
-    $WRITE_DACL     = 0x00040000; $WRITE_OWNER    = 0x00080000
-    $WRITE_PROP     = 0x00000020; $EXTENDED_RIGHT = 0x00000010 
+    # -----------------------------------------------------------------------
+    # STEP 0: ANALYZE CURRENT USER TOKEN
+    # -----------------------------------------------------------------------
+    $myIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $mySIDs = @($myIdentity.User.Value)
+    foreach ($g in $myIdentity.Groups) { $mySIDs += $g.Value }
     
-    $GUID_RESET_PWD  = "00299570-246d-11d0-a768-00aa006e0529"
-    $GUID_MEMBER     = "bf967a9c-0de6-11d0-a285-00aa003049e2"
-    $GUID_GPLINK     = "f30e3bc2-9ca0-11d1-b603-0000f80367c1"
-    $GUID_SPN        = "28630eb0-41d5-11d1-a9c1-0000f80367c1"
+    Write-Line "    [*] Analyzed current user token. Tracking $($mySIDs.Count) nested group SIDs." "Gray"
+
+    # CONSTANTS
+    $GENERIC_ALL    = 0x10000000
+    $EXCHANGE_FULL  = 983551      # 0x000F01FF (Mapped GenericAll in AD)
+    $WRITE_DACL     = 0x00040000
+    $WRITE_OWNER    = 0x00080000
+    $GENERIC_WRITE  = 0x40000000
+    $WRITE_PROP     = 0x00000020
+    $EXTENDED_RIGHT = 0x00000010 
+    
+    $GUID_RESET_PWD = "00299570-246d-11d0-a768-00aa006e0529"
+    $GUID_MEMBER    = "bf967a9c-0de6-11d0-a285-00aa003049e2"
+    $GUID_GPLINK    = "f30e3bc2-9ca0-11d1-b603-0000f80367c1"
+    $GUID_SPN       = "28630eb0-41d5-11d1-a9c1-0000f80367c1"
+
+    # -----------------------------------------------------------------------
+    # STEP 1: DOMAIN ROOT SCAN
+    # -----------------------------------------------------------------------
+    try {
+        $domDN = $global:State.BaseDN
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher
+        $searcher.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$domDN")
+        $searcher.SearchScope = "Base" 
+        $searcher.Filter = "(objectClass=domainDNS)"
+        $searcher.SecurityMasks = "Dacl"
+        [void]$searcher.PropertiesToLoad.Add("ntsecuritydescriptor")
+        
+        $rootResult = $searcher.FindOne()
+        
+        if ($rootResult) {
+            $sdBytes = $rootResult.Properties["ntsecuritydescriptor"][0]
+            $sd = New-Object System.Security.AccessControl.RawSecurityDescriptor ($sdBytes, 0)
+            
+            $rootReported = @{}
+
+            foreach ($ace in $sd.DiscretionaryAcl) {
+                $sid = $ace.SecurityIdentifier.Value
+                $mask = [int]$ace.AccessMask
+                
+                # Filter Noise: 512(DA), 519(EA), 18(System), 544(Administrators)
+                if ($sid -match "-512$" -or $sid -match "-519$" -or $sid -match "-18$" -or $sid -match "-544$") { continue }
+                
+                $isMe = if ($mySIDs -contains $sid) { " [YOU HAVE THIS]" } else { "" }
+                
+                # [FIX]: GenericAll OR 983551 Check
+                if ( ($mask -band $GENERIC_ALL) -ne 0 -or $mask -eq $EXCHANGE_FULL ) {
+                    $dedupKey = "$sid-GenericAll-Root"
+                    if (-not $rootReported[$dedupKey]) {
+                        $principalName = $sid
+                        try { $principalName = $ace.SecurityIdentifier.Translate([System.Security.Principal.NTAccount]).Value } catch {}
+                        Add-Finding "ACL" "$principalName -> $domDN (DOMAIN ROOT)$isMe" "HIGH" "GenericAll (Full Control)." "You own this object." | Out-Null; $found = $true
+                        
+                        $rootReported[$dedupKey] = $true
+                        $rootReported["$sid-WriteDacl-Root"] = $true
+                    }
+                    continue
+                }
+
+                if (($mask -band $WRITE_DACL) -ne 0) { 
+                    $dedupKey = "$sid-WriteDacl-Root"
+                    if (-not $rootReported[$dedupKey]) {
+                        $principalName = $sid
+                        try { $principalName = $ace.SecurityIdentifier.Translate([System.Security.Principal.NTAccount]).Value } catch {}
+                        Add-Finding "ACL" "$principalName -> $domDN (DOMAIN ROOT)$isMe" "HIGH" "WriteDacl on Domain Root." "PV: Add-DomainObjectAcl -TargetIdentity '$domDN' -PrincipalIdentity '$principalName' -Rights DCSync" | Out-Null; $found = $true
+                        $rootReported[$dedupKey] = $true
+                    }
+                }
+            }
+        }
+    } catch {
+        Write-Line "    [!] Error scanning Domain Root: $($_.Exception.Message)" "Red"
+    }
+
+    # -----------------------------------------------------------------------
+    # STEP 2: STANDARD OBJECT SCAN
+    # -----------------------------------------------------------------------
+    $filter = "(|(objectClass=user)(objectClass=computer)(objectClass=group)(objectClass=groupPolicyContainer)(objectClass=organizationalUnit))"
+    $res = Search-LDAP -Filter $filter -Properties @("ntsecuritydescriptor","samaccountname","displayname","objectclass","distinguishedname","name")
 
     foreach ($entry in $res) {
+        if ($Stealth) { Start-Sleep -Milliseconds 10 }
+        
         $rawSD = $entry.Properties["ntsecuritydescriptor"]
         if (-not $rawSD) { continue }
         
-        $targetName = if($entry.Properties["samaccountname"]) { $entry.Properties["samaccountname"][0] } else { $entry.Properties["displayname"][0] }
+        $targetName = if($entry.Properties["samaccountname"]) { $entry.Properties["samaccountname"][0] } else { $entry.Properties["name"][0] }
         $targetDN   = $entry.Properties["distinguishedname"][0]
         
         $classes = $entry.Properties["objectclass"]
@@ -259,37 +337,89 @@ function Enum-ACLPrivilege {
 
         try {
             $sd = New-Object System.Security.AccessControl.RawSecurityDescriptor ($rawSD[0], 0)
+            $objReported = @{}
+
             foreach ($ace in $sd.DiscretionaryAcl) {
-                $mask = $ace.AccessMask; $sid = $ace.SecurityIdentifier.Value
+                $mask = [int]$ace.AccessMask; $sid = $ace.SecurityIdentifier.Value
                 $aceGuid = if ($ace.ObjectType) { $ace.ObjectType.ToString() } else { $null }
 
-                if ($sid -match "-512$" -or $sid -match "-519$" -or $sid -match "-18$") { continue }
+                # Filter Noise: 512(DA), 519(EA), 18(System), 544(Administrators)
+                if ($sid -match "-512$" -or $sid -match "-519$" -or $sid -match "-18$" -or $sid -match "-544$") { continue }
 
-                if (($mask -band $GENERIC_ALL) -ne 0) {
-                     Add-Finding "ACL" "$sid -> $targetName ($type)" "HIGH" "GenericAll (Full Control)." "You own this object." | Out-Null; $found = $true
+                $isMe = if ($mySIDs -contains $sid) { " [YOU HAVE THIS]" } else { "" }
+                
+                # --- 1. PRIORITY RIGHTS ---
+                
+                # [FIX]: GenericAll OR 983551 Check
+                if ( ($mask -band $GENERIC_ALL) -ne 0 -or $mask -eq $EXCHANGE_FULL ) {
+                     $k = "$sid-GenericAll"
+                     if (-not $objReported[$k]) {
+                        Add-Finding "ACL" "$sid -> $targetName ($type)$isMe" "HIGH" "GenericAll (Full Control)." "You own this object. Full Control." | Out-Null; $found = $true
+                        
+                        $objReported[$k] = $true
+                        $objReported["$sid-WriteDacl"] = $true
+                        $objReported["$sid-WriteOwner"] = $true
+                     }
+                     continue 
                 }
-                elseif (($mask -band $WRITE_DACL) -ne 0) {
-                     Add-Finding "ACL" "$sid -> $targetName ($type)" "HIGH" "WriteDacl (Change Perms)." "PowerView: Add-DomainObjectAcl -TargetIdentity '$targetDN' -PrincipalIdentity '$sid' -Rights All" | Out-Null; $found = $true
-                }
-                elseif (($mask -band $WRITE_OWNER) -ne 0) {
-                     Add-Finding "ACL" "$sid -> $targetName ($type)" "HIGH" "WriteOwner (Take Ownership)." "PowerView: Set-DomainObjectOwner -TargetIdentity '$targetDN' -PrincipalIdentity '$sid'" | Out-Null; $found = $true
+
+                if (($mask -band $WRITE_DACL) -ne 0) {
+                     $k = "$sid-WriteDacl"
+                     if (-not $objReported[$k]) {
+                        Add-Finding "ACL" "$sid -> $targetName ($type)$isMe" "HIGH" "WriteDacl (Change Perms)." "PV: Add-DomainObjectAcl -TargetIdentity '$targetDN' -PrincipalIdentity '$sid' -Rights All" | Out-Null; $found = $true
+                        $objReported[$k] = $true
+                     }
                 }
                 
+                if (($mask -band $WRITE_OWNER) -ne 0) {
+                     $k = "$sid-WriteOwner"
+                     if (-not $objReported[$k]) {
+                        Add-Finding "ACL" "$sid -> $targetName ($type)$isMe" "HIGH" "WriteOwner (Take Ownership)." "PV: Set-DomainObjectOwner -TargetIdentity '$targetDN' -PrincipalIdentity '$sid'" | Out-Null; $found = $true
+                        $objReported[$k] = $true
+                     }
+                }
+                
+                if (($mask -band $GENERIC_WRITE) -ne 0 -and $isMe) { 
+                     $k = "$sid-GenericWrite"
+                     if (-not $objReported[$k]) {
+                        Add-Finding "ACL" "$sid -> $targetName ($type)$isMe" "MEDIUM" "GenericWrite." "Can update properties." | Out-Null; $found = $true
+                        $objReported[$k] = $true
+                     }
+                }
+                
+                # --- 2. PROPERTY WRITES ---
                 if (($mask -band $WRITE_PROP) -ne 0) {
                     if ($type -eq "Group" -and ($aceGuid -eq $GUID_MEMBER -or $aceGuid -eq $null)) { 
-                        Add-Finding "ACL" "$sid -> $targetName ($type)" "HIGH" "WriteProperty: Member." "net group `"$targetName`" '$sid' /add /domain" | Out-Null; $found = $true
+                        $k = "$sid-AddMember"
+                        if (-not $objReported[$k]) {
+                            Add-Finding "ACL" "$sid -> $targetName ($type)$isMe" "HIGH" "WriteProperty: Member." "net group `"$targetName`" '$env:USERNAME' /add /domain" | Out-Null; $found = $true
+                            $objReported[$k] = $true
+                        }
                     }
                     if (($type -eq "User" -or $type -eq "Computer") -and ($aceGuid -eq $GUID_SPN)) {
-                        Add-Finding "ACL" "$sid -> $targetName ($type)" "HIGH" "WriteProperty: SPN." "PowerView: Set-DomainObject -Identity '$targetName' -Set @{serviceprincipalname='hack/test'}" | Out-Null; $found = $true
+                        $k = "$sid-WriteSPN"
+                        if (-not $objReported[$k]) {
+                            Add-Finding "ACL" "$sid -> $targetName ($type)$isMe" "HIGH" "WriteProperty: SPN." "PowerView: Set-DomainObject -Identity '$targetName' -Set @{serviceprincipalname='hack/test'}" | Out-Null; $found = $true
+                            $objReported[$k] = $true
+                        }
                     }
                     if ($type -eq "OU" -and ($aceGuid -eq $GUID_GPLINK)) {
-                        Add-Finding "ACL" "$sid -> $targetName ($type)" "HIGH" "WriteProperty: gPLink." "PowerView: New-GPLink -Name 'MaliciousGPO' -Target '$targetDN'" | Out-Null; $found = $true
+                        $k = "$sid-GPLink"
+                        if (-not $objReported[$k]) {
+                            Add-Finding "ACL" "$sid -> $targetName ($type)$isMe" "HIGH" "WriteProperty: gPLink." "PowerView: New-GPLink -Name 'MaliciousGPO' -Target '$targetDN'" | Out-Null; $found = $true
+                            $objReported[$k] = $true
+                        }
                     }
                 }
 
+                # --- 3. EXTENDED RIGHTS ---
                 if (($mask -band $EXTENDED_RIGHT) -ne 0) {
                     if ($aceGuid -eq $GUID_RESET_PWD) {
-                        Add-Finding "ACL" "$sid -> $targetName ($type)" "HIGH" "ExtendedRight: Reset Password." "PowerView: Set-DomainUserPassword -Identity '$targetName' -Account '$sid' -NewPassword 'P@ssw0rd!'" | Out-Null; $found = $true
+                        $k = "$sid-ResetPwd"
+                        if (-not $objReported[$k]) {
+                            Add-Finding "ACL" "$sid -> $targetName ($type)$isMe" "HIGH" "ExtendedRight: Reset Password." "PowerView: Set-DomainUserPassword -Identity '$targetName' -Account '$sid' -NewPassword 'P@ssw0rd!'" | Out-Null; $found = $true
+                            $objReported[$k] = $true
+                        }
                     }
                 }
             }
@@ -576,110 +706,142 @@ function Analyze-AttackChains {
     Write-Line "    [*] Correlating findings to identify Kill Chains..." "Gray"
     $chainsFound = $false
 
-    # 1. DATA PREPARATION (NORMALIZATION)
-    # Collect compromised/weak users (Kerberoast, AS-REP) and clean the names
+    # 1. DATA PREPARATION
     $compromisableUsers = @()
     $global:State.Findings | Where-Object { $_.Category -in @("AS-REP", "Kerberoast") } | ForEach-Object {
-        # Clean format (DOMAIN\User or User@domain -> User)
         $cleanName = $_.Name.Split("\")[-1].Split("@")[0]
         $compromisableUsers += $cleanName
     }
+    
+    # Get Critical ACLs
+    $aclFindings = $global:State.Findings | Where-Object { $_.Category -eq "ACL" -and $_.Severity -eq "HIGH" }
 
     # -----------------------------------------------------------------------
-    # CHAIN 1: The "Weakest Link" (Roastable User -> High Privileges)
+    # CHAIN 0: ACL ESCALATION
     # -----------------------------------------------------------------------
-    
-    # A) Exchange Check
+    foreach ($acl in $aclFindings) {
+        
+        # A) Domain Root Takeover (NEW LOGIC)
+        # If ANYONE has WriteDacl/GenericAll on Domain Root, it is a critical path.
+        if ($acl.Name -match "DOMAIN ROOT") {
+            # Extract the Principal name from the string "Principal -> Target"
+            $principal = $acl.Name.Split("-")[0].Trim()
+            
+            Write-Line ""
+            Write-Line "    [!!!] KILL CHAIN 0: Domain Root Takeover ($principal)" "Red"
+            Write-Line "        1. Finding: '$principal' has critical rights on the Domain Root." "Gray"
+            Write-Line "        2. Risk: $($acl.Details)" "Gray"
+            Write-Line "        3. Action: If you can compromise '$principal', you own the domain." "White"
+            $chainsFound = $true
+        }
+
+        # B) Weak User -> High Privileges
+        foreach ($weakUser in $compromisableUsers) {
+            if ($acl.Name -match "\b$weakUser\b" -or $acl.Details -match "\b$weakUser\b") {
+                Write-Line ""
+                Write-Line "    [!!!] KILL CHAIN 1: Roastable User -> ACL Escalation" "Red"
+                Write-Line "        1. Phase 1: Compromise user '$weakUser' via Roasting." "Gray"
+                Write-Line "        2. Phase 2: User has critical ACL rights: $($acl.Name)" "Gray"
+                Write-Line "        3. Action: Abuse ACL ($($acl.Details)) to take control." "White"
+                $chainsFound = $true
+            }
+        }
+
+        # C) Direct Escalation (Current User)
+        if ($acl.Name -match "YOU HAVE THIS") {
+            Write-Line ""
+            Write-Line "    [!!!] KILL CHAIN 0: Direct ACL Escalation (YOU)" "Red"
+            Write-Line "        1. Finding: Your current token has critical rights." "Gray"
+            Write-Line "        2. Target: $($acl.Name)" "Gray"
+            Write-Line "        3. Action: Execute the TTP command immediately." "White"
+            $chainsFound = $true
+        }
+    }
+
+    # -----------------------------------------------------------------------
+    # CHAIN: Exchange
+    # -----------------------------------------------------------------------
     $exchangeFindings = $global:State.Findings | Where-Object { $_.Category -eq "Exchange" }
     foreach ($ex in $exchangeFindings) {
         foreach ($weakUser in $compromisableUsers) {
-            # Regex Word Boundary (\b) for exact match
             if ($ex.Name -match "\b$weakUser\b") {
                 Write-Line ""
-                Write-Line "    [!!!] KILL CHAIN 1: Roastable User -> Domain Admin (via Exchange)" "Red"
-                Write-Line "        1. Phase 1: Kerberoast/AS-REP Roast user '$weakUser'." "Gray"
-                Write-Line "        2. Phase 2: Crack the hash (Hashcat)." "Gray"
-                Write-Line "        3. Phase 3: User is in privileged Exchange group." "Gray"
-                Write-Line "        4. Action: Perform DCSync targeting the Domain Root." "White"
+                Write-Line "    [!!!] KILL CHAIN: Roastable User -> Exchange DCSync" "Red"
+                Write-Line "        1. Phase 1: Crack hash for '$weakUser'." "Gray"
+                Write-Line "        2. Phase 2: User is in privileged Exchange group." "Gray"
+                Write-Line "        3. Action: Perform DCSync." "White"
                 $chainsFound = $true
             }
         }
     }
 
     # -----------------------------------------------------------------------
-    # CHAIN 2: LAPS Leakage
+    # CHAIN: LAPS
     # -----------------------------------------------------------------------
     $lapsFindings = $global:State.Findings | Where-Object { $_.Category -eq "LAPS" }
     foreach ($laps in $lapsFindings) {
         foreach ($weakUser in $compromisableUsers) {
-            # Check Name or Details for the weak user
-            if ($laps.Name -match "\b$weakUser\b" -or $laps.Details -match "\b$weakUser\b") {
+            if ($laps.Name -match "\b$weakUser\b") {
                 Write-Line ""
-                Write-Line "    [!!!] KILL CHAIN 2: Roastable User -> Local Admin (LAPS)" "Red"
-                Write-Line "        1. Phase 1: Compromise user '$weakUser' via Roasting." "Gray"
-                Write-Line "        2. Phase 2: User can read LAPS passwords." "Gray"
-                Write-Line "        3. Action: Dump LAPS password for target computer." "White"
+                Write-Line "    [!!!] KILL CHAIN: Roastable User -> LAPS Dump" "Red"
+                Write-Line "        1. Phase 1: Crack hash for '$weakUser'." "Gray"
+                Write-Line "        2. Action: Dump LAPS password." "White"
                 $chainsFound = $true
             }
         }
     }
 
     # -----------------------------------------------------------------------
-    # CHAIN 3: Unconstrained Delegation Pivot
+    # CHAIN: Unconstrained Delegation
     # -----------------------------------------------------------------------
     $unc = $global:State.Findings | Where-Object { $_.Details -match "Unconstrained Delegation" }
     if ($unc) {
         Write-Line ""
-        Write-Line "    [!!!] KILL CHAIN 3: Unconstrained Delegation -> DC Compromise" "Red"
+        Write-Line "    [!!!] KILL CHAIN: Unconstrained Delegation -> DC Compromise" "Red"
         Write-Line "        1. Target: Server '$($unc.Name)' has Unconstrained Delegation." "Gray"
-        Write-Line "        2. Prereq: Compromise this server (Local Admin)." "Gray"
-        Write-Line "        3. Action: Use PrinterBug/PetitPotam to coerce DC authentication." "Gray"
-        Write-Line "        4. Impact: Export DC TGT from memory -> DCSync." "White"
+        Write-Line "        2. Prereq: Compromise this server." "Gray"
+        Write-Line "        3. Action: Coerce DC auth (PetitPotam) & Dump TGT." "White"
         $chainsFound = $true
     }
 
     # -----------------------------------------------------------------------
-    # CHAIN 4: ADCS Escalation (ESC1/ESC6)
+    # CHAIN: ADCS
     # -----------------------------------------------------------------------
     $adcs = $global:State.Findings | Where-Object { $_.Category -eq "ADCS" -and ($_.Name -match "ESC1" -or $_.Name -match "ESC6") }
     if ($adcs) {
         Write-Line ""
-        Write-Line "    [!!!] KILL CHAIN 4: Certificate Injection -> Instant Admin" "Red"
+        Write-Line "    [!!!] KILL CHAIN: ADCS -> Domain Admin" "Red"
         Write-Line "        1. Vulnerability: $($adcs[0].Name)" "Gray"
-        Write-Line "        2. Requirement: Any valid domain user credentials." "Gray"
-        Write-Line "        3. Action: Request certificate for 'Administrator' or 'DC$'." "Gray"
-        Write-Line "        4. Impact: Authenticate via PKINIT as Domain Admin." "White"
+        Write-Line "        2. Action: Request certificate for 'Administrator'." "White"
         $chainsFound = $true
     }
 
     # -----------------------------------------------------------------------
-    # CHAIN 5: GPO Pivot
+    # CHAIN: GPO
     # -----------------------------------------------------------------------
     $gpp = $global:State.Findings | Where-Object { $_.Category -eq "GPO" }
     if ($gpp) {
         Write-Line ""
-        Write-Line "    [!!!] KILL CHAIN 5: GPP Password -> Lateral Movement" "Red"
-        Write-Line "        1. Finding: Encrypted password found in SYSVOL XML." "Gray"
-        Write-Line "        2. Action: Decrypt using 'gpp-decrypt'." "Gray"
-        Write-Line "        3. Impact: Often provides Local Admin across many machines." "White"
+        Write-Line "    [!!!] KILL CHAIN: GPO Password -> Lateral Movement" "Red"
+        Write-Line "        1. Finding: Decryptable password in SYSVOL." "Gray"
+        Write-Line "        2. Action: Use 'gpp-decrypt'." "White"
         $chainsFound = $true
     }
 
     # -----------------------------------------------------------------------
-    # CHAIN 6: Hybrid Identity (Cloud Hop)
+    # CHAIN: Hybrid
     # -----------------------------------------------------------------------
     $hybrid = $global:State.Findings | Where-Object { $_.Category -eq "Hybrid" }
     if ($hybrid) {
         Write-Line ""
-        Write-Line "    [!!!] KILL CHAIN 6: On-Prem -> Azure AD Global Admin" "Red"
-        Write-Line "        1. Target: Azure AD Connect Server/Account found." "Gray"
-        Write-Line "        2. Action: Extract 'MSOL_' credentials from SQL DB." "Gray"
-        Write-Line "        3. Impact: DCSync in the cloud (Replicate directory)." "White"
+        Write-Line "    [!!!] KILL CHAIN: On-Prem -> Cloud Admin" "Red"
+        Write-Line "        1. Target: Azure AD Connect Server." "Gray"
+        Write-Line "        2. Action: Extract MSOL credentials." "White"
         $chainsFound = $true
     }
 
     if (-not $chainsFound) {
-        Write-Line "    [-] No obvious low-hanging attack chains detected based on gathered data." "DarkGray"
+        Write-Line "    [-] No obvious low-hanging attack chains detected." "DarkGray"
     }
 }
 
