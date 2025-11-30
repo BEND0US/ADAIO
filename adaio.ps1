@@ -132,15 +132,52 @@ function Init-AD {
 }
 
 function Search-LDAP {
-    param([string]$Filter, [string[]]$Properties = @("*"))
+    param(
+        [string]$Filter, 
+        [string[]]$Properties = @("*"),
+        [switch]$LoadDacl
+    )
+    
     if ($Stealth) { Start-Sleep -Milliseconds (Get-Random -Min 100 -Max 500) }
+    
     $searcher = New-Object System.DirectoryServices.DirectorySearcher
     try {
         $searcher.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$($global:State.BaseDN)")
-        $searcher.PageSize = 1000; $searcher.Filter = $Filter; $searcher.SecurityMasks = "Dacl"
+        $searcher.PageSize = 1000
+        $searcher.Filter = $Filter
+        
+        if ($LoadDacl) {
+            $searcher.SecurityMasks = "Dacl"
+        }
+
         foreach ($p in $Properties) { [void]$searcher.PropertiesToLoad.Add($p) }
-        return $searcher.FindAll()
-    } catch { return @() } finally { $searcher.Dispose() }
+        
+        $rawResults = $searcher.FindAll()
+        $cleanOutput = @()
+
+        foreach ($result in $rawResults) {
+            $propBag = @{}
+            
+            foreach ($propName in $result.Properties.PropertyNames) {
+
+                $propBag[$propName] = @($result.Properties[$propName])
+            }
+
+            $obj = [PSCustomObject]@{
+                Properties = $propBag
+                Path = $result.Path
+            }
+            
+            $cleanOutput += $obj
+        }
+
+        return $cleanOutput
+
+    } catch { 
+        return @() 
+    } finally {
+        $searcher.Dispose()
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -189,31 +226,65 @@ function Enum-Identity {
     Write-Section "Identity Vectors"
     $found = $false
 
-    # AS-REP Roasting
-    $res = Search-LDAP -Filter "(&(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=4194304))" -Properties @("samaccountname")
-    foreach ($r in $res) { 
-        Add-Finding "AS-REP" $r.Properties["samaccountname"][0] "MEDIUM" "Pre-Auth Disabled." "Hashcat Mode: 18200. Tool: Rubeus asreproast" | Out-Null
+    # 1. AS-REP ROASTING
+    $searcher = New-Object System.DirectoryServices.DirectorySearcher
+    $searcher.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$($global:State.BaseDN)")
+    $searcher.Filter = "(&(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=4194304))"
+    $results = $searcher.FindAll()
+
+    foreach ($res in $results) {
+        $name = if ($res.Properties["samaccountname"].Count -gt 0) { $res.Properties["samaccountname"][0] } else { "Unknown" }
+        Add-Finding "AS-REP" $name "MEDIUM" "Pre-Auth Disabled." "Hashcat Mode: 18200. Tool: Rubeus asreproast" | Out-Null
         $found = $true
+    }
+    $searcher.Dispose()
+
+    # 2. KERBEROASTING
+    $searcher = New-Object System.DirectoryServices.DirectorySearcher
+    $searcher.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$($global:State.BaseDN)")
+    $searcher.Filter = "(&(objectClass=user)(servicePrincipalName=*))"
+    $searcher.PageSize = 1000
+    
+    [void]$searcher.PropertiesToLoad.Add("samaccountname")
+    [void]$searcher.PropertiesToLoad.Add("serviceprincipalname")
+    [void]$searcher.PropertiesToLoad.Add("admincount")
+    [void]$searcher.PropertiesToLoad.Add("pwdlastset")
+
+    try {
+        $results = $searcher.FindAll()
+        
+        foreach ($res in $results) {
+            if ($res.Properties["samaccountname"].Count -eq 0) { continue }
+            $name = $res.Properties["samaccountname"][0]
+            
+            if ($name -eq "krbtgt") { continue }
+
+            $isHigh = $false
+            if ($res.Properties["admincount"].Count -gt 0) {
+                if ($res.Properties["admincount"][0] -eq 1) { $isHigh = $true }
+            }
+
+            $pwdAge = "Unknown"
+            if ($res.Properties["pwdlastset"].Count -gt 0) {
+                try {
+                    $lastSet = [DateTime]::FromFileTime($res.Properties["pwdlastset"][0])
+                    $days = [int]((Get-Date) - $lastSet).TotalDays
+                    $pwdAge = "$days days"
+                } catch {}
+            }
+
+            $severity = "MEDIUM"
+            if ($isHigh) { $severity = "HIGH" }
+
+            Add-Finding "Kerberoast" $name $severity "SPN Account. PwdAge: $pwdAge." "Hashcat Mode: 13100. Tool: Rubeus kerberoast" | Out-Null
+            $found = $true
+        }
+    } catch {
+        Write-Host "   [!] LDAP Error: $($_.Exception.Message)" -ForegroundColor Red
+    } finally {
+        $searcher.Dispose()
     }
 
-    # Kerberoasting
-    $res = Search-LDAP -Filter "(&(objectClass=user)(servicePrincipalName=*))" -Properties @("samaccountname","admincount","pwdlastset")
-    foreach ($r in $res) {
-        $name = $r.Properties["samaccountname"][0]
-        $isHigh = ($r.Properties["admincount"] -and $r.Properties["admincount"][0] -eq 1)
-        
-        $pwdAge = "Unknown"
-        if ($r.Properties["pwdlastset"]) {
-            try { 
-                $days = [int]((Get-Date) - [DateTime]::FromFileTime($r.Properties["pwdlastset"][0])).TotalDays 
-                $pwdAge = "$days days"
-            } catch {}
-        }
-        
-        Add-Finding "Kerberoast" $name (if($isHigh){"HIGH"}else{"MEDIUM"}) "SPN Account. PwdAge: $pwdAge." "Hashcat Mode: 13100. Tool: Rubeus kerberoast" | Out-Null
-        $found = $true
-    }
-    
     if (-not $found) { Write-Line "    [-] No AS-REP or Kerberoastable accounts found." "DarkGray" }
 }
 
@@ -318,7 +389,7 @@ function Enum-ACLPrivilege {
     # STEP 2: STANDARD OBJECT SCAN
     # -----------------------------------------------------------------------
     $filter = "(|(objectClass=user)(objectClass=computer)(objectClass=group)(objectClass=groupPolicyContainer)(objectClass=organizationalUnit))"
-    $res = Search-LDAP -Filter $filter -Properties @("ntsecuritydescriptor","samaccountname","displayname","objectclass","distinguishedname","name")
+    $res = Search-LDAP -Filter $filter -Properties @("ntsecuritydescriptor","samaccountname","displayname","objectclass","distinguishedname","name") -LoadDacl
 
     foreach ($entry in $res) {
         if ($Stealth) { Start-Sleep -Milliseconds 10 }
