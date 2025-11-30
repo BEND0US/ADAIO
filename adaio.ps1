@@ -783,6 +783,15 @@ function Analyze-AttackChains {
         $cleanName = $_.Name.Split("\")[-1].Split("@")[0]
         $compromisableUsers += $cleanName
     }
+
+    $roastings = $global:State.Findings | Where-Object { $_.Category -in @("AS-REP", "Kerberoast") }
+    foreach ($r in $roastings) {
+        Write-Line ""
+        Write-Line "    [!!!] KILL CHAIN: Credential Access ($($r.Category))" "Red"
+        Write-Line "        1. Target: $($r.Name)" "Gray"
+        Write-Line "        2. Action: Request Ticket -> Crack Hash." "White"
+        $chainsFound = $true
+    }
     
     # Get Critical ACLs
     $aclFindings = $global:State.Findings | Where-Object { $_.Category -eq "ACL" -and $_.Severity -eq "HIGH" }
