@@ -234,6 +234,10 @@ function Enum-Identity {
 
     foreach ($res in $results) {
         $name = if ($res.Properties["samaccountname"].Count -gt 0) { $res.Properties["samaccountname"][0] } else { "Unknown" }
+        
+        # [FIX] Safer check for machine accounts using .EndsWith()
+        if ($name.EndsWith("$")) { continue }
+
         Add-Finding "AS-REP" $name "MEDIUM" "Pre-Auth Disabled." "Hashcat Mode: 18200. Tool: Rubeus asreproast" | Out-Null
         $found = $true
     }
@@ -257,7 +261,9 @@ function Enum-Identity {
             if ($res.Properties["samaccountname"].Count -eq 0) { continue }
             $name = $res.Properties["samaccountname"][0]
             
-            if ($name -eq "krbtgt") { continue }
+            # [FIX]: Filter out 'krbtgt' AND Machine Accounts using .EndsWith("$")
+            # This avoids Regex parsing errors completely.
+            if ($name -eq "krbtgt" -or $name.EndsWith("$")) { continue }
 
             $isHigh = $false
             if ($res.Properties["admincount"].Count -gt 0) {
@@ -559,29 +565,97 @@ function Enum-Delegation {
 function Enum-LAPS {
     Write-Section "LAPS Dumping (Legacy & v2)"
     $found = $false
-    $GUID_LAPS_V1 = "bf9679c0-0de6-11d0-a285-00aa003049e2"; $GUID_LAPS_V2 = "0046a362-d273-421c-ad66-0080c796798e"
     
-    $comps = Search-LDAP -Filter "(&(objectCategory=computer)(|(ms-Mcs-AdmPwd=*)(msLAPS-Password=*)))" -Properties @("ntsecuritydescriptor","name")
-    if ($comps.Count -eq 0) { $comps = Search-LDAP -Filter "(objectCategory=computer)" -Properties @("ntsecuritydescriptor","name") }
+    # GUIDs
+    $GUID_LAPS_V1 = "bf9679c0-0de6-11d0-a285-00aa003049e2" 
+    $GUID_LAPS_V2 = "0046a362-d273-421c-ad66-0080c796798e" 
+    
+    $GENERIC_ALL  = 0x10000000
+    $READ_PROP    = 0x00000010
+
+    # 1. Search Computers
+    $props = @("ntsecuritydescriptor","name","distinguishedname", "ms-mcs-admpwd", "mslaps-password", "ms-mcs-admpwdexpirationtime", "mslaps-passwordexpirationtime")
+    
+    $filter = "(&(objectCategory=computer)(|(ms-Mcs-AdmPwd=*)(msLAPS-Password=*)(ms-Mcs-AdmPwdExpirationTime=*)(msLAPS-PasswordExpirationTime=*)))"
+    
+    $comps = Search-LDAP -Filter $filter -Properties $props
+    
+    if ($comps.Count -eq 0) { 
+        $comps = Search-LDAP -Filter "(objectCategory=computer)" -Properties $props 
+    }
+
+    Write-Line "    [*] Analyzing $($comps.Count) computers..." "Gray"
 
     foreach ($c in $comps) {
+        $compName = $c.Properties["name"][0]
+        
+        # --- [CHECK 1] DIRECT PASSWORD READ (CRITICAL) ---
+        $lapsPass = $null
+        if ($c.Properties["ms-mcs-admpwd"]) { $lapsPass = $c.Properties["ms-mcs-admpwd"][0] }
+        elseif ($c.Properties["mslaps-password"]) { $lapsPass = $c.Properties["mslaps-password"][0] }
+
+        if ($lapsPass) {
+            Add-Finding "LAPS" $compName "HIGH" "CLEAR-TEXT PASSWORD FOUND!" "Password: $lapsPass" | Out-Null; $found = $true
+            continue
+        }
+
+        # --- [CHECK 2] PRESENCE DETECTION (INFO) ---
+        $lapsExp = $null
+        if ($c.Properties["ms-mcs-admpwdexpirationtime"]) { $lapsExp = $c.Properties["ms-mcs-admpwdexpirationtime"][0] }
+        elseif ($c.Properties["mslaps-passwordexpirationtime"]) { $lapsExp = $c.Properties["mslaps-passwordexpirationtime"][0] }
+
+        if ($lapsExp) {
+            try { $expDate = [DateTime]::FromFileTime($lapsExp) } catch { $expDate = "Present" }
+            Add-Finding "LAPS" $compName "INFO" "LAPS is Active (Access Denied to Password)." "Next Rotation: $expDate" | Out-Null
+            $found = $true
+        }
+
+        # --- [CHECK 3] ACL ANALYSIS (Who can read it?) ---
         $raw = $c.Properties["ntsecuritydescriptor"]
         if (-not $raw) { continue }
+
         try {
             $sd = New-Object System.Security.AccessControl.RawSecurityDescriptor ($raw[0], 0)
+            $reported = @{}
+
             foreach ($ace in $sd.DiscretionaryAcl) {
+                $sid = $ace.SecurityIdentifier.Value
+                $mask = [int]$ace.AccessMask
+                
+                if ($sid -match "-512$" -or $sid -match "-519$" -or $sid -match "-18$" -or $sid -match "-544$") { continue }
+                
+                # 1. Specific LAPS GUID
                 if ($ace.ObjectType) {
-                    $ag = $ace.ObjectType.ToString()
-                    if ($ag -eq $GUID_LAPS_V1 -or $ag -eq $GUID_LAPS_V2) {
-                        $sid = $ace.SecurityIdentifier.Value
-                        if ($sid -match "-512$" -or $sid -match "-519$" -or $sid -match "-18$") { continue } 
-                        Add-Finding "LAPS" "$sid -> $($c.Properties["name"][0])" "HIGH" "Can read LAPS password." "PowerView: Get-DomainComputer -Identity TARGET -Properties ms-mcs-admpwd" | Out-Null; $found = $true
+                    $guid = $ace.ObjectType.ToString()
+                    if ($guid -eq $GUID_LAPS_V1 -or $guid -eq $GUID_LAPS_V2) {
+                        if (-not $reported["$sid-Specific"]) {
+                            Add-Finding "LAPS" "$sid -> $compName" "HIGH" "Explicit LAPS Read Rights." "Targeted LAPS Reader." | Out-Null; $found = $true
+                            $reported["$sid-Specific"] = $true
+                        }
+                        continue
+                    }
+                }
+
+                # 2. GenericAll
+                if (($mask -band $GENERIC_ALL) -ne 0) {
+                    if (-not $reported["$sid-Full"]) {
+                        Add-Finding "LAPS" "$sid -> $compName" "HIGH" "GenericAll (Full Control)." "Has control over object, can read LAPS." | Out-Null; $found = $true
+                        $reported["$sid-Full"] = $true
+                    }
+                    continue
+                }
+
+                # 3. Read All Properties
+                if (-not $ace.ObjectType -and ($mask -band $READ_PROP) -ne 0) {
+                     if (-not $reported["$sid-ReadAll"]) {
+                        Add-Finding "LAPS" "$sid -> $compName" "HIGH" "Read All Properties." "Can read all attributes including LAPS." | Out-Null; $found = $true
+                        $reported["$sid-ReadAll"] = $true
                     }
                 }
             }
         } catch {}
     }
-    if (-not $found) { Write-Line "    [-] No unauthorized LAPS readers found." "DarkGray" }
+    if (-not $found) { Write-Line "    [-] No unauthorized LAPS readers or passwords found." "DarkGray" }
 }
 
 function Enum-DCSync {
@@ -801,10 +875,8 @@ function Analyze-AttackChains {
     # -----------------------------------------------------------------------
     foreach ($acl in $aclFindings) {
         
-        # A) Domain Root Takeover (NEW LOGIC)
-        # If ANYONE has WriteDacl/GenericAll on Domain Root, it is a critical path.
+        # A) Domain Root Takeover
         if ($acl.Name -match "DOMAIN ROOT") {
-            # Extract the Principal name from the string "Principal -> Target"
             $principal = $acl.Name.Split("-")[0].Trim()
             
             Write-Line ""
@@ -860,6 +932,19 @@ function Analyze-AttackChains {
     # -----------------------------------------------------------------------
     $lapsFindings = $global:State.Findings | Where-Object { $_.Category -eq "LAPS" }
     foreach ($laps in $lapsFindings) {
+        
+        # [FIX] Scenario A: Password ALREADY Found!
+        if ($laps.Details -match "CLEAR-TEXT PASSWORD") {
+            Write-Line ""
+            Write-Line "    [!!!] KILL CHAIN: LAPS Leakage -> Local Admin" "Red"
+            Write-Line "        1. Target: $($laps.Name)" "Gray"
+            Write-Line "        2. Finding: Clear-text LAPS password discovered." "Gray"
+            Write-Line "        3. Action: Login as local Administrator immediately." "White"
+            $chainsFound = $true
+            continue
+        }
+
+        # Scenario B: Weak User can read LAPS
         foreach ($weakUser in $compromisableUsers) {
             if ($laps.Name -match "\b$weakUser\b") {
                 Write-Line ""
